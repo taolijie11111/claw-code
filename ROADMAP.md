@@ -6428,3 +6428,69 @@ Original filing (2026-04-18): the session emitted `SessionStart hook (completed)
 
 
 450. **`prompt` emits `kind:"missing_credentials"` JSON on STDERR (not stdout), leaving stdout at 0 bytes — automation pattern `output=$(claw prompt hello --output-format json)` captures nothing on auth-absent failure; `doctor` correctly surfaces `auth.status:"warn"` with `api_key_present:false` but exposes no `prompt_ready:false` field that automation can check before invoking `prompt`** — dogfooded 2026-05-16 by Jobdori on `a35ee9a0` in response to Clawhip pinpoint nudge at `1505208225321062521`. Exact reproduction (isolated env, no creds, fresh git repo, HEAD `a35ee9a0`): `timeout 5 env -i HOME=$ISOLATED_HOME PATH=$PATH CLAW_CONFIG_HOME=$PROBE/.claw-cfg claw prompt hello --output-format json > stdout.txt 2> stderr.txt` → stdout = **0 bytes**, stderr = 195 bytes containing `{"error":"missing Anthropic credentials…","exit_code":1,"hint":null,"kind":"missing_credentials","type":"error"}`, exit code 1. Confirms Gaebal's `1505208553793781792` pinpoint that `prompt` timeout + zero bytes was the prior state — HEAD `a35ee9a0` now correctly exits 1 with `kind:"missing_credentials"` **but the envelope is still routed to stderr** (issue #447 class, same class as prior entries #422, #435). **Contrast with `doctor`:** `claw doctor --output-format json 2>/dev/null` succeeds to stdout with `checks[auth].status:"warn"`, `api_key_present:false`, `auth_token_present:false` — but the auth check has no `prompt_ready:false` field. Automation that gates on `doctor` before invoking `prompt` must re-derive readiness from `api_key_present && auth_token_present` — there is no single canonical boolean. **Three compound problems:** (a) **stdout-empty on `--output-format json` failure**: same class as #447; `prompt`'s error envelope goes to stderr, not stdout. The canonical automation idiom `if ! result=$(claw prompt "q" --output-format json); then echo "$result" | jq .kind; fi` sees `$result=""` on failure — the jq call gets nothing. All `--output-format json` error paths must route JSON to stdout per #447 contract; (b) **`doctor` missing `prompt_ready` field**: `doctor --output-format json` already knows auth is absent (`api_key_present:false`) but surfaces no derived `prompt_ready:bool` or `prompt_blocked_reason:string` field. Automation must infer readiness from `api_key_present || auth_token_present || legacy_*_present` — a 5-field OR across legacy fields that is fragile as auth mechanisms evolve. A single `prompt_ready:false` (with `prompt_blocked_reason:"auth_missing"`) inside the `auth` check would give downstream a stable contract; (c) **`claw prompt` with no auth does no preflight and fires straight at the API**: the preflight check that `doctor` runs (auth discovery) is not reused by `prompt` to emit a fast typed error before attempting the network call. Both Gaebal's pinpoint (prompt hanging silently on older HEAD) and the current behavior (prompt hitting auth gate after a brief API attempt) stem from the same root: prompt does not short-circuit at the point where `doctor` already knows auth is absent. If `doctor` can emit `kind:"doctor"` with `auth.status:"warn"` in ~20ms without a network call, `prompt` should emit `kind:"missing_credentials"` in the same window and output it to stdout. **Required fix shape:** (a) `prompt --output-format json` must write the `kind:"missing_credentials"` JSON envelope to **stdout**, not stderr — same fix as #447 for all error envelopes; (b) add `prompt_ready:bool` and `prompt_blocked_reason:string|null` to the `auth` check in `doctor --output-format json`; derive it as `api_key_present || auth_token_present || legacy_saved_oauth_present`; (c) `prompt` must run the credential preflight check (same codepath as doctor's auth check) before attempting any API call and emit `{"kind":"missing_credentials","prompt_blocked_reason":"auth_missing"}` on **stdout** with exit 1 if the check fails; (d) `--output-format json` stdout routing fix must cover: `prompt`, `session list` (cross-ref #449), `skills uninstall` (cross-ref #431), `resume` (cross-ref #435), `acp serve` (cross-ref #443) — the full `kind:"missing_credentials"` class; (e) regression test: `claw prompt hello --output-format json` with no creds writes JSON to stdout (0 bytes stderr), exits 1, `kind:"missing_credentials"`, in under 200ms (no network attempt). **Why this matters:** `prompt` is the primary consumer entry point. Auth-absent failure routing to stderr breaks every automation wrapper that captures `$(claw prompt ... --output-format json)`. The `doctor` preflight metadata gap means auth-readiness checks require parsing 5 legacy fields instead of reading one boolean. Cross-references #447 (all JSON error envelopes on stderr), #449 (session list hits auth gate), #431 (skills uninstall hits auth gate), #357 (auth gate on local ops cluster), #422 (exit-code parity). Source: Jobdori live dogfood, `a35ee9a0`, 2026-05-16.
+
+467. **`claw doctor` auth preflight is Anthropic-only even when the selected model/provider is OpenAI-compatible: `claw --model openai/gpt-4 doctor --output-format json` with `OPENAI_API_KEY` set reports auth `warn` / `no supported auth env vars were found`, while `status` in the same invocation reports `model: "openai/gpt-4"`, `model_source: "flag"`, and `status: "ok"`. Conversely, if both `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` are set with `--model openai/gpt-4`, doctor reports auth `ok` because the irrelevant Anthropic key exists, not because the selected OpenAI provider is authenticated. The preflight auth check is hardcoded to Anthropic env vars and ignores provider metadata (`api_key_env`, `base_url_env`) that runtime routing already uses** — dogfooded 2026-05-24 for the 18:00 Clawhip nudge at message `1508167732355530752`, reproduced on local `./rust/target/debug/claw` `git_sha 003b739d` (origin/main `f8e1bb72`) in a clean isolated env.
+
+    Reproduction matrix:
+
+    ```bash
+    # A. default Anthropic model + only OPENAI_API_KEY
+    env -i HOME=/tmp/iso26/home OPENAI_API_KEY=sk-openai-fake PATH=/usr/bin:/bin TERM=dumb \
+      claw --output-format json doctor | jq '.checks[] | select(.name=="auth")'
+    # => warn: no supported auth env vars were found
+
+    # B. selected OpenAI provider + only OPENAI_API_KEY
+    env -i HOME=/tmp/iso26/home OPENAI_API_KEY=sk-openai-fake PATH=/usr/bin:/bin TERM=dumb \
+      claw --output-format json --model openai/gpt-4 doctor | jq '.checks[] | select(.name=="auth")'
+    # => SAME warn: no supported auth env vars were found  ❌ wrong provider/auth preflight
+
+    # status in the same env knows the selected model is OpenAI:
+    env -i HOME=/tmp/iso26/home OPENAI_API_KEY=sk-openai-fake PATH=/usr/bin:/bin TERM=dumb \
+      claw --output-format json --model openai/gpt-4 status | jq '{status,model,model_raw,model_source}'
+    # => {"status":"ok","model":"openai/gpt-4","model_raw":"openai/gpt-4","model_source":"flag"}
+
+    # C. selected OpenAI provider + both OpenAI and Anthropic keys
+    env -i HOME=/tmp/iso26/home OPENAI_API_KEY=sk-openai-fake ANTHROPIC_API_KEY=sk-ant-fake PATH=/usr/bin:/bin TERM=dumb \
+      claw --output-format json --model openai/gpt-4 doctor | jq '.checks[] | select(.name=="auth")'
+    # => ok because ANTHROPIC_API_KEY is present, even though selected provider is OpenAI ❌
+    ```
+
+    Observed auth payloads:
+
+    ```json
+    // --model openai/gpt-4 + only OPENAI_API_KEY
+    {
+      "api_key_present": false,
+      "auth_token_present": false,
+      "details": ["Environment       api_key=absent auth_token=absent"],
+      "name": "auth",
+      "status": "warn",
+      "summary": "no supported auth env vars were found"
+    }
+
+    // --model openai/gpt-4 + OPENAI_API_KEY + ANTHROPIC_API_KEY
+    {
+      "api_key_present": true,
+      "auth_token_present": false,
+      "details": ["Environment       api_key=present auth_token=absent"],
+      "name": "auth",
+      "status": "ok",
+      "summary": "supported auth env vars are configured"
+    }
+    ```
+
+    **Root cause traced:** `rust/crates/rusty-claude-cli/src/main.rs:2071-2150` `check_auth_health()` hardcodes only Anthropic env vars:
+
+    ```rust
+    let api_key_present = env::var("ANTHROPIC_API_KEY").ok().is_some_and(|value| !value.trim().is_empty());
+    let auth_token_present = env::var("ANTHROPIC_AUTH_TOKEN").ok().is_some_and(|value| !value.trim().is_empty());
+    // summary = "supported auth env vars are configured" iff either Anthropic var exists
+    ```
+
+    But provider routing metadata already exists in `rust/crates/api/src/providers/mod.rs`: `ProviderMetadata` includes `provider`, `api_key_env`, `base_url_env`, `default_base_url`, and model-prefix detection. Runtime dispatch uses `detect_provider_kind(&model)` / metadata to route OpenAI-compatible models; doctor/auth preflight ignores it and evaluates Anthropic only. This creates a split-brain preflight: `status` sees the OpenAI model flag, runtime would use OpenAI-compatible auth, but `doctor` audits Anthropic env vars.
+
+    **Why distinct from existing items:** ROADMAP **#28** improved auth error copy when users set adjacent provider env vars or put `sk-ant-*` in the wrong Anthropic var. This pinpoint is not error copy during a failed API call; it is local `doctor` preflight using the wrong provider's auth rules. ROADMAP **#29** fixed CLI runtime dispatch so `openai/...` uses OpenAI-compatible client; this entry shows the preflight health check did not follow that routing fix. ROADMAP **#465** covers Anthropic-only mixed env vars (`ANTHROPIC_API_KEY` + `ANTHROPIC_AUTH_TOKEN`) and missing `effective_auth_source`; this entry covers cross-provider model-selected auth (`OPENAI_API_KEY` should be considered when selected provider is OpenAI). ROADMAP **#466** covers provider base URL validation; this covers provider auth env validation. ROADMAP **#248** asks runtime lifecycle events to expose provider/auth source after prompt starts; this is the local doctor/status preflight counterpart before prompt starts.
+
+    **Why this matters:** (1) **False warning:** OpenAI users following documented prefix routing (`--model openai/gpt-4` + `OPENAI_API_KEY`) get `doctor` auth warn, even though the selected provider has the expected key. That makes doctor untrustworthy for non-Anthropic lanes. (2) **False ok:** If a stale Anthropic key exists in the environment, doctor reports auth ok for an OpenAI model even if `OPENAI_API_KEY` is missing. That is worse than no check because it green-lights a lane that will fail with missing OpenAI credentials. (3) **Routing and preflight drift:** #29 fixed runtime dispatch, but doctor still reasons as if claw is Anthropic-only. Every new provider added to metadata will inherit this preflight false-negative/false-positive unless doctor keys off provider metadata. (4) **Automation cannot trust auth preflight.** A clawhip lane planner checking `doctor` before starting an OpenAI-compatible prompt cannot tell whether the lane is actually authenticated for the selected provider. (5) **The data model already exists.** Provider metadata carries the exact env var names; the diagnostic layer just needs to use it.
+
+    **Required fix shape:** (a) Thread the selected model/provider into `check_auth_health()` (or add a `check_provider_auth_health(model)` helper) and resolve `ProviderMetadata` with the same function runtime dispatch uses. (b) Emit structured fields: `selected_provider`, `required_api_key_env`, `required_auth_envs`, `selected_provider_api_key_present`, `anthropic_api_key_present`, `openai_api_key_present`, `xai_api_key_present`, `dashscope_api_key_present`, and `effective_auth_source` where applicable. (c) For OpenAI-compatible selected providers, auth status should be `ok` when the provider's own key is present, regardless of Anthropic vars; warn/fail when it is absent even if Anthropic keys exist. (d) Mirror provider-auth summary into `status --output-format json`, since status is the lightweight preflight surface. (e) Regression matrix: default Anthropic + Anthropic key; OpenAI model + OpenAI key; OpenAI model + only Anthropic key (should warn/fail); OpenAI model + both keys (should ok with selected_provider=`openai`, not because Anthropic exists); XAI/DashScope equivalents. **Acceptance check:** `env -i HOME=$TMP OPENAI_API_KEY=sk-test PATH=$PATH claw --model openai/gpt-4 doctor --output-format json | jq -e '.checks[] | select(.name=="auth") | .status == "ok" and .selected_provider == "openai" and .required_api_key_env == "OPENAI_API_KEY"'` should pass; currently it warns that no supported auth env vars were found. Source: gaebal-gajae dogfood for the 2026-05-24 18:00 Clawhip nudge. Coordination note: still avoided F/CLAW_CONFIG_HOME due to Jobdori public claim; this provider-auth-preflight mismatch is orthogonal and credential-free.
