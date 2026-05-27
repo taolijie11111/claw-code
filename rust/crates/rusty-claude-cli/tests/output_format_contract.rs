@@ -2217,6 +2217,58 @@ fn interactive_only_guard_batch_769_to_771() {
 }
 
 #[test]
+fn dump_manifests_missing_dir_has_typed_kind_and_hint_785() {
+    // #785: dump-manifests had two stale single-line --manifests-dir errors.
+    // JSON callers got error_kind:"unknown" + hint:null instead of a typed
+    // missing_flag_value they can route without prose scraping.
+    let root = unique_temp_dir("dump-manifests-missing-dir-785");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let cases: &[&[&str]] = &[
+        &[
+            "--output-format",
+            "json",
+            "dump-manifests",
+            "--manifests-dir",
+        ],
+        &[
+            "--output-format",
+            "json",
+            "dump-manifests",
+            "--manifests-dir=",
+        ],
+    ];
+
+    for args in cases {
+        let output = run_claw(&root, args, &[]);
+        assert!(
+            !output.status.success(),
+            "claw {} should exit non-zero",
+            args.join(" ")
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let json_line = stderr
+            .lines()
+            .find(|l| l.trim_start().starts_with('{'))
+            .unwrap_or_else(|| panic!("stderr should contain JSON for {:?}, got: {stderr}", args));
+        let parsed: serde_json::Value = serde_json::from_str(json_line)
+            .expect("dump-manifests arg error envelope should be valid JSON");
+        assert_eq!(
+            parsed["error_kind"], "missing_flag_value",
+            "claw {:?} must return missing_flag_value (#785): {parsed}",
+            args
+        );
+        assert!(
+            parsed["hint"]
+                .as_str()
+                .map_or(false, |h| h.contains("dump-manifests")),
+            "claw {:?} must expose dump-manifests usage hint (#785): {parsed}",
+            args
+        );
+    }
+}
+
+#[test]
 fn resume_plugin_mutations_are_typed_interactive_only_777() {
     // #777: `/plugins install|enable|disable|uninstall|update` in resume mode returned
     // a generic single-line error; after #776's classify/split it fell to
